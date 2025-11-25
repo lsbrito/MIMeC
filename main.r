@@ -6,7 +6,7 @@ library(Metrics)
 library(reshape2)
 
 ui <- fluidPage(
-  titlePanel("Preenchimento de Dados de Temperatura - INMET"),
+  titlePanel("MIMeC – Modelo de Interpolação Meteorológica Computacional"),
   
   sidebarLayout(
     sidebarPanel(
@@ -17,11 +17,11 @@ ui <- fluidPage(
                                      "Kalman" = "kalman",
                                      "STL (sazonal)" = "stl"),
                          selected = c("linear","kalman")),
-      numericInput("freq", "Frequência sazonal (ex.: diária=365, horária=24*365)", value = 365, min = 1),
-      sliderInput("valpct", "Porcentagem para validação (mascarar):", min = 5, max = 30, value = 10, step = 1),
-      numericInput("seed", "Seed (reprodutibilidade)", value = 123, min = 1),
       actionButton("run", "Rodar Imputação"),
-      downloadButton("download", "Exportar resultados (CSV)")
+      downloadButton("download", "Exportar resultados (CSV)"),
+      br(),
+      h4("Parâmetros automáticos utilizados:"),
+      verbatimTextOutput("params")
     ),
     
     mainPanel(
@@ -38,26 +38,36 @@ server <- function(input, output) {
     req(input$file)
     
     # 1) Ler CSV com uma coluna de temperatura, vírgula como decimal
-    # Não definir sep, pois há apenas uma coluna
     data <- read.csv(input$file$datapath, header = FALSE, dec = ",")
     x <- as.numeric(data[,1])
     
-    # Verificações simples
     if (all(is.na(x))) {
-      showNotification("Arquivo inválido: todos os valores são NA. Verifique o formato (uma coluna, vírgula decimal).", type = "error")
+      showNotification("Arquivo inválido: todos os valores são NA.", type = "error")
       return(NULL)
     }
     
     n <- length(x)
     idx_known <- which(!is.na(x))
-    if (length(idx_known) < 10) {
-      showNotification("Poucos pontos conhecidos. Adicione mais dados ou reduza a porcentagem de validação.", type = "warning")
-    }
     
-    # 2) Criar máscara de validação: retirar aleatoriamente uma porcentagem dos pontos conhecidos
-    set.seed(input$seed)
-    n_val <- max(1, ceiling(input$valpct/100 * length(idx_known)))
+    # Seed automático = tamanho da série
+    seed <- n
+    set.seed(seed)
+    
+    # Porcentagem de validação adaptativa
+    valpct <- if (n < 500) 5 else if (n <= 10000) 10 else 20
+    n_val <- max(1, ceiling(valpct/100 * length(idx_known)))
     val_idx <- sample(idx_known, size = n_val)
+    
+    # Frequência sazonal automática (horária)
+    dias <- floor(n/24)
+    freq <- 24 * dias
+    
+    # Mostrar parâmetros na interface
+    output$params <- renderText({
+      paste0("Frequência sazonal (STL): ", freq, "\n",
+             "Porcentagem para validação: ", valpct, "% (", n_val, " pontos mascarados)\n",
+             "Seed (reprodutibilidade): ", seed)
+    })
     
     x_masked <- x
     x_masked[val_idx] <- NA
@@ -65,11 +75,10 @@ server <- function(input, output) {
     imputations <- list()
     metrics <- data.frame(Metodo = character(), MAE = numeric(), RMSE = numeric(), stringsAsFactors = FALSE)
     
-    # 3) Aplicar métodos selecionados
+    # Linear
     if ("linear" %in% input$methods) {
-      x_lin <- tryCatch(na_interpolation(x_masked, option = "linear"), error = function(e) rep(NA_real_, n))
+      x_lin <- na_interpolation(x_masked, option = "linear")
       imputations$Linear <- x_lin
-      # Métricas calculadas somente nos pontos mascarados (val_idx)
       metrics <- rbind(metrics, data.frame(
         Metodo = "Linear",
         MAE = mae(x[val_idx], x_lin[val_idx]),
@@ -77,8 +86,9 @@ server <- function(input, output) {
       ))
     }
     
+    # Spline
     if ("spline" %in% input$methods) {
-      x_spline <- tryCatch(na_interpolation(x_masked, option = "spline"), error = function(e) rep(NA_real_, n))
+      x_spline <- na_interpolation(x_masked, option = "spline")
       imputations$Spline <- x_spline
       metrics <- rbind(metrics, data.frame(
         Metodo = "Spline",
@@ -87,8 +97,9 @@ server <- function(input, output) {
       ))
     }
     
+    # Kalman
     if ("kalman" %in% input$methods) {
-      x_kalman <- tryCatch(na_kalman(x_masked, model = "auto.arima"), error = function(e) rep(NA_real_, n))
+      x_kalman <- na_kalman(x_masked, model = "auto.arima")
       imputations$Kalman <- x_kalman
       metrics <- rbind(metrics, data.frame(
         Metodo = "Kalman",
@@ -97,10 +108,10 @@ server <- function(input, output) {
       ))
     }
     
+    # STL
     if ("stl" %in% input$methods) {
-      # STL precisa de um ts com frequência definida
-      ts_x <- ts(x_masked, frequency = input$freq)
-      x_stl <- tryCatch(na_seadec(ts_x, algorithm = "interpolation"), error = function(e) rep(NA_real_, n))
+      ts_x <- ts(x_masked, frequency = freq)
+      x_stl <- na_seadec(ts_x, algorithm = "interpolation")
       x_stl <- as.numeric(x_stl)
       imputations$`STL (sazonal)` <- x_stl
       metrics <- rbind(metrics, data.frame(
@@ -110,7 +121,7 @@ server <- function(input, output) {
       ))
     }
     
-    # 4) Plot: original, mascarada e imputações
+    # Plot
     output$plot <- renderPlot({
       df <- data.frame(Index = 1:n, Original = x, Mascarada = x_masked)
       for (m in names(imputations)) df[[m]] <- imputations[[m]]
@@ -118,7 +129,6 @@ server <- function(input, output) {
       
       ggplot(df_long, aes(x = Index, y = value, color = variable)) +
         geom_line(alpha = 0.9) +
-        # Destacar pontos mascarados e estimados
         geom_point(data = subset(df_long, variable != "Original" & Index %in% val_idx),
                    size = 1.2, alpha = 0.7) +
         labs(title = "Comparação dos Métodos de Imputação (com validação)",
@@ -126,21 +136,21 @@ server <- function(input, output) {
         theme_minimal()
     })
     
-    # 5) Tabela de métricas
+    # Métricas
     output$metrics <- renderTable({
       metrics[order(metrics$MAE), ]
     }, digits = 4)
     
-    # 6) Prévia dos dados imputados
+    # Prévia
     output$preview <- renderTable({
       df_out <- data.frame(Index = 1:n, Original = x, Mascarada = x_masked)
       for (m in names(imputations)) df_out[[m]] <- imputations[[m]]
       head(df_out, 12)
     }, digits = 3)
     
-    # 7) Exportar CSV com imputações
+    # Exportar CSV
     output$download <- downloadHandler(
-      filename = function() paste0("imputacoes_inmet_", Sys.Date(), ".csv"),
+      filename = function() paste0("imputacoes_mimec_", Sys.Date(), ".csv"),
       content = function(file) {
         df_out <- data.frame(Index = 1:n, Original = x, Mascarada = x_masked)
         for (m in names(imputations)) df_out[[m]] <- imputations[[m]]
